@@ -211,21 +211,58 @@ window.onload=()=>{
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-// ── FETCH PRICES ──
+// ── FETCH PRICES (Binance - kein CORS) ──
+// Binance Symbole
+const BINANCE = {
+  ETH:"ETHUSDT", BTC:"BTCUSDT", SOL:"SOLUSDT",
+  HBAR:"HBARUSDT", NEAR:"NEARUSDT", AVAX:"AVAXUSDT", KAS:"KASUSDT"
+};
+
 async function fetchPrices(){
-  const ids=COINS.map(c=>c.id).join(",");
-  const r=await fetch("https://api.coingecko.com/api/v3/simple/price?ids="+ids+"&vs_currencies=usd&include_24hr_change=true");
-  if(!r.ok) throw new Error("CoinGecko "+r.status);
-  const j=await r.json();
-  COINS.forEach(c=>{
-    if(j[c.id]){
-      prices[c.sym]={price:j[c.id].usd, chg:j[c.id].usd_24h_change||0};
+  try {
+    // Binance 24hr ticker - kein CORS Problem
+    const syms = Object.values(BINANCE).map(s => '"'+s+'"').join(",");
+    const url = "https://api.binance.com/api/v3/ticker/24hr?symbols=["+syms+"]";
+    const r = await fetch(url);
+    if(!r.ok) throw new Error("Binance "+r.status);
+    const arr = await r.json();
+    arr.forEach(t => {
+      const entry = Object.entries(BINANCE).find(([sym,bs]) => bs === t.symbol);
+      if(entry) {
+        const sym = entry[0];
+        const price = parseFloat(t.lastPrice);
+        const chg = parseFloat(t.priceChangePercent);
+        prices[sym] = {price, chg};
+        if(!priceHist[sym]) priceHist[sym]=[];
+        priceHist[sym].push(price);
+        if(priceHist[sym].length>14) priceHist[sym].shift();
+      }
+    });
+    addLog("f","Preise via Binance: ETH $"+(prices.ETH?.price?.toFixed(0)||"?")+" BTC $"+(prices.BTC?.price?.toFixed(0)||"?"));
+  } catch(e) {
+    // Fallback: einzelne Ticker abfragen
+    addLog("f","Binance batch fehlgeschlagen, versuche einzeln...");
+    await fetchPricesFallback();
+  }
+}
+
+async function fetchPricesFallback(){
+  for(const c of COINS){
+    try{
+      const sym = BINANCE[c.sym];
+      if(!sym) continue;
+      const r = await fetch("https://api.binance.com/api/v3/ticker/24hr?symbol="+sym);
+      if(!r.ok) continue;
+      const t = await r.json();
+      const price = parseFloat(t.lastPrice);
+      const chg = parseFloat(t.priceChangePercent);
+      prices[c.sym]={price,chg};
       if(!priceHist[c.sym]) priceHist[c.sym]=[];
-      priceHist[c.sym].push(j[c.id].usd);
+      priceHist[c.sym].push(price);
       if(priceHist[c.sym].length>14) priceHist[c.sym].shift();
-    }
-  });
-  addLog("f","Preise: ETH $"+(prices.ETH?.price?.toFixed(0)||"?")+" BTC $"+(prices.BTC?.price?.toFixed(0)||"?"));
+    }catch(e){ addLog("f","Fehler "+c.sym+": "+e.message); }
+  }
+  addLog("f","Einzelpreise geladen");
 }
 
 // ── SIGNAL ENGINE (100% lokal) ──
