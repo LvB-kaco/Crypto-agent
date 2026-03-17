@@ -22,6 +22,8 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
 .btn-g{color:#00E5A0;} .btn-g:hover{border-color:#00E5A0;}
 .btn-r{color:#FF3355;border-color:rgba(255,51,85,.2);} .btn-r:hover{border-color:#FF3355;}
 .btn:disabled{color:#243444!important;cursor:not-allowed;}
+.lev-btn{color:#4A6A80;min-width:32px;}
+.lev-btn.on{color:#00E5A0;border-color:rgba(0,229,160,.4);background:rgba(0,229,160,.08);}
 
 /* PORTFOLIO BAR */
 .pbar{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px;}
@@ -120,6 +122,12 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
         <div class="h-info" id="statusEl">STARTET...</div>
         <div class="countdown" id="cdEl"></div>
       </div>
+      <div style="display:flex;align-items:center;gap:4px">
+        <span style="font-size:8px;color:#243444;letter-spacing:2px">SYNC:</span>
+        <button class="btn lev-btn on" id="int1" onclick="setInterval2(1)">1m</button>
+        <button class="btn lev-btn" id="int2" onclick="setInterval2(2)">2m</button>
+        <button class="btn lev-btn" id="int5" onclick="setInterval2(5)">5m</button>
+      </div>
       <button class="btn btn-g" id="btnScan" onclick="fullScan()">↺ SCAN</button>
       <button class="btn btn-r" onclick="doReset()">↺ RESET</button>
     </div>
@@ -145,7 +153,7 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
   <div class="boot" id="bootEl" style="display:none">
     <div id="bootBars"></div>
     <div class="boot-txt" id="bootTxt">INITIALISIERUNG...</div>
-    <div class="boot-sub">PREISE LADEN · SIGNALE BERECHNEN · TRADES PRÜFEN</div>
+    <div class="boot-sub">PREISE · VOLUMEN · MACD · RSI · SIGNALE · TRADES</div>
     <div class="dots">
       <div class="dot" style="animation-delay:0s"></div>
       <div class="dot" style="animation-delay:.15s"></div>
@@ -190,7 +198,9 @@ const COINS=[
   {id:"avalanche-2",    sym:"AVAX", name:"Avalanche",     sl:.08},
   {id:"kaspa",          sym:"KAS",  name:"Kaspa",         sl:.10},
 ];
-const START=10000, POS_SIZE=0.15, INTERVAL=5*60*1000;
+const START=10000, POS_SIZE=0.15;
+let SCAN_MINS=1, INTERVAL=1*60*1000;
+let LEVERAGE=1; // auto-set by bot
 
 let prices={}, signals={}, priceHist={};
 let port={cash:START,positions:{},trades:[],total:0,wins:0};
@@ -206,91 +216,267 @@ window.onload=()=>{
     const m=Math.floor(left/60000), s=Math.floor((left%60000)/1000);
     document.getElementById("cdEl").textContent="SCAN IN: "+m+":"+s.toString().padStart(2,"0");
   },1000);
-  setInterval(()=>{ if(!scanning) fullScan(); },INTERVAL);
+  window._scanTimer=setInterval(()=>{ if(!scanning) fullScan(); },INTERVAL);
 };
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-// ── FETCH PRICES (Binance - kein CORS) ──
-// Binance Symbole
-const BINANCE = {
-  ETH:"ETHUSDT", BTC:"BTCUSDT", SOL:"SOLUSDT",
-  HBAR:"HBARUSDT", NEAR:"NEARUSDT", AVAX:"AVAXUSDT", KAS:"KASUSDT"
-};
+// ── EXCHANGE SYMBOLE ──
+const BINANCE={ETH:"ETHUSDT",BTC:"BTCUSDT",SOL:"SOLUSDT",HBAR:"HBARUSDT",NEAR:"NEARUSDT",AVAX:"AVAXUSDT"};
+const KUCOIN={KAS:"KAS-USDT"}; // KAS nur auf KuCoin
 
+// Klines-Historie für MACD (close prices, 1h Kerzen, 26 Stück)
+const klineHist={};
+// Volumen-Historie
+const volHist={};
+
+// ── EMA Berechnung ──
+function calcEMA(data, period){
+  if(data.length < period) return null;
+  const k = 2/(period+1);
+  let ema = data.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for(let i=period;i<data.length;i++) ema = data[i]*k + ema*(1-k);
+  return ema;
+}
+
+// ── MACD Berechnung ──
+function calcMACD(closes){
+  if(closes.length < 26) return {macd:null,signal:null,hist:null};
+  const ema12 = calcEMA(closes, 12);
+  const ema26 = calcEMA(closes, 26);
+  if(!ema12||!ema26) return {macd:null,signal:null,hist:null};
+  const macdLine = ema12 - ema26;
+  // Signal line: EMA9 of MACD values (simplified: use last 9 MACD snapshots)
+  const macdSnaps = (klineHist[Object.keys(klineHist)[0]]||[]).length >= 9
+    ? calcEMA(closes.slice(-9).map((_,i)=>{
+        const sl=closes.slice(0,closes.length-9+i+1);
+        const e12=calcEMA(sl,Math.min(12,sl.length));
+        const e26=calcEMA(sl,Math.min(26,sl.length));
+        return e12&&e26?e12-e26:0;
+      }), 9)
+    : macdLine * 0.95;
+  const signalLine = macdSnaps || macdLine * 0.95;
+  return {macd:macdLine, signal:signalLine, hist:macdLine-signalLine};
+}
+
+// ── FETCH PREISE + VOLUMEN ──
 async function fetchPrices(){
-  try {
-    // Binance 24hr ticker - kein CORS Problem
-    const syms = Object.values(BINANCE).map(s => '"'+s+'"').join(",");
-    const url = "https://api.binance.com/api/v3/ticker/24hr?symbols=["+syms+"]";
-    const r = await fetch(url);
+  try{
+    const syms=Object.values(BINANCE).map(s=>'"'+s+'"').join(",");
+    const r=await fetch("https://api.binance.com/api/v3/ticker/24hr?symbols=["+syms+"]");
     if(!r.ok) throw new Error("Binance "+r.status);
-    const arr = await r.json();
-    arr.forEach(t => {
-      const entry = Object.entries(BINANCE).find(([sym,bs]) => bs === t.symbol);
-      if(entry) {
-        const sym = entry[0];
-        const price = parseFloat(t.lastPrice);
-        const chg = parseFloat(t.priceChangePercent);
-        prices[sym] = {price, chg};
-        if(!priceHist[sym]) priceHist[sym]=[];
-        priceHist[sym].push(price);
-        if(priceHist[sym].length>14) priceHist[sym].shift();
-      }
+    const arr=await r.json();
+    arr.forEach(t=>{
+      const entry=Object.entries(BINANCE).find(([s,bs])=>bs===t.symbol);
+      if(!entry) return;
+      const sym=entry[0];
+      const price=parseFloat(t.lastPrice);
+      const chg=parseFloat(t.priceChangePercent);
+      const vol=parseFloat(t.quoteVolume); // 24h Volumen in USD
+      const volChg=parseFloat(t.count);    // Anzahl Trades
+      prices[sym]={price,chg,vol,volChg};
+      // Preishistorie für RSI
+      if(!priceHist[sym]) priceHist[sym]=[];
+      priceHist[sym].push(price);
+      if(priceHist[sym].length>26) priceHist[sym].shift();
+      // Volumen-Historie
+      if(!volHist[sym]) volHist[sym]=[];
+      volHist[sym].push(vol);
+      if(volHist[sym].length>10) volHist[sym].shift();
     });
-    addLog("f","Preise via Binance: ETH $"+(prices.ETH?.price?.toFixed(0)||"?")+" BTC $"+(prices.BTC?.price?.toFixed(0)||"?"));
-  } catch(e) {
-    // Fallback: einzelne Ticker abfragen
-    addLog("f","Binance batch fehlgeschlagen, versuche einzeln...");
-    await fetchPricesFallback();
+    addLog("f","Preise+Vol: ETH $"+(prices.ETH?.price?.toFixed(0)||"?")+" Vol:$"+(prices.ETH?.vol?( prices.ETH.vol/1e6).toFixed(0)+"M":"?"));
+  }catch(e){
+    addLog("f","Batch-Fehler: "+e.message+" — versuche einzeln");
+    await fetchSingle();
   }
 }
 
-async function fetchPricesFallback(){
+async function fetchSingle(){
   for(const c of COINS){
     try{
-      const sym = BINANCE[c.sym];
-      if(!sym) continue;
-      const r = await fetch("https://api.binance.com/api/v3/ticker/24hr?symbol="+sym);
+      // KAS → KuCoin, Rest → Binance
+      if(c.sym==="KAS"){
+        await fetchKAS(); continue;
+      }
+      const bs=BINANCE[c.sym]; if(!bs) continue;
+      const r=await fetch("https://api.binance.com/api/v3/ticker/24hr?symbol="+bs);
       if(!r.ok) continue;
-      const t = await r.json();
-      const price = parseFloat(t.lastPrice);
-      const chg = parseFloat(t.priceChangePercent);
-      prices[c.sym]={price,chg};
+      const t=await r.json();
+      const price=parseFloat(t.lastPrice), chg=parseFloat(t.priceChangePercent), vol=parseFloat(t.quoteVolume);
+      prices[c.sym]={price,chg,vol};
       if(!priceHist[c.sym]) priceHist[c.sym]=[];
       priceHist[c.sym].push(price);
-      if(priceHist[c.sym].length>14) priceHist[c.sym].shift();
+      if(priceHist[c.sym].length>26) priceHist[c.sym].shift();
+      if(!volHist[c.sym]) volHist[c.sym]=[];
+      volHist[c.sym].push(vol);
+      if(volHist[c.sym].length>10) volHist[c.sym].shift();
     }catch(e){ addLog("f","Fehler "+c.sym+": "+e.message); }
   }
   addLog("f","Einzelpreise geladen");
 }
 
-// ── SIGNAL ENGINE (100% lokal) ──
+async function fetchKAS(){
+  try{
+    // KuCoin public API - kein CORS Problem
+    const r=await fetch("https://api.kucoin.com/api/v1/market/stats?symbol=KAS-USDT");
+    if(!r.ok) throw new Error("KuCoin "+r.status);
+    const j=await r.json();
+    const d=j.data;
+    const price=parseFloat(d.last);
+    const open=parseFloat(d.open);
+    const chg=((price-open)/open)*100;
+    const vol=parseFloat(d.volValue); // Volumen in USDT
+    prices.KAS={price,chg,vol};
+    if(!priceHist.KAS) priceHist.KAS=[];
+    priceHist.KAS.push(price);
+    if(priceHist.KAS.length>26) priceHist.KAS.shift();
+    if(!volHist.KAS) volHist.KAS=[];
+    volHist.KAS.push(vol);
+    if(volHist.KAS.length>10) volHist.KAS.shift();
+    addLog("f","KAS via KuCoin: $"+price.toFixed(5)+" ("+chg.toFixed(2)+"%)");
+  }catch(e){
+    addLog("f","KAS KuCoin Fehler: "+e.message);
+  }
+}
+
+// ── INTERVALL UMSCHALTEN ──
+function setInterval2(mins){
+  SCAN_MINS=mins;
+  INTERVAL=mins*60*1000;
+  ["1","2","5"].forEach(v=>{
+    const el=document.getElementById("int"+v);
+    if(el) el.classList.toggle("on", parseInt(v)===mins);
+  });
+  // Restart timer mit neuem Intervall
+  clearInterval(window._scanTimer);
+  window._scanTimer=setInterval(()=>{ if(!scanning) fullScan(); }, INTERVAL);
+  nextScan=Date.now()+INTERVAL;
+  addLog("f","Sync-Intervall geändert auf "+mins+" Minute"+(mins>1?"n":""));
+}
+
+// ── BOLLINGER BÄNDER ──
+function calcBollinger(data, period=20, mult=2){
+  if(data.length < period) return {upper:null,lower:null,mid:null};
+  const slice=data.slice(-period);
+  const mid=slice.reduce((a,b)=>a+b,0)/period;
+  const variance=slice.reduce((a,b)=>a+Math.pow(b-mid,2),0)/period;
+  const std=Math.sqrt(variance);
+  return {upper:mid+mult*std, lower:mid-mult*std, mid, std, bw:((2*mult*std)/mid)*100};
+}
+
+// ── SIGNAL ENGINE: RSI + MACD + VOLUMEN ──
 function calcSignals(){
   COINS.forEach(c=>{
     const px=prices[c.sym]?.price;
     const chg=prices[c.sym]?.chg||0;
-    if(!px){signals[c.sym]={sym:c.sym,signal:"HOLD",strength:40,reason:"Keine Daten",target:0,stopLoss:0,rsi:50};return;}
+    const vol=prices[c.sym]?.vol||0;
+    if(!px){signals[c.sym]={sym:c.sym,signal:"HOLD",strength:40,reason:"Keine Daten",target:0,stopLoss:0,rsi:50,macdHist:0,volSpike:false};return;}
+
     const hist=priceHist[c.sym]||[px];
-    // RSI
+
+    // ── RSI ──
     let gains=0,losses=0;
     for(let i=1;i<hist.length;i++){const d=hist[i]-hist[i-1];if(d>0)gains+=d;else losses+=Math.abs(d);}
-    const ag=gains/(hist.length||1), al=losses/(hist.length||1)||.0001;
+    const ag=gains/Math.max(hist.length-1,1), al=losses/Math.max(hist.length-1,1)||.0001;
     const rsi=100-(100/(1+ag/al));
-    // Signal
-    let signal="HOLD",strength=45,reason="Konsolidierung";
-    if(rsi<35&&chg>-2){signal="BUY";strength=72+Math.min(18,Math.abs(chg)*3);reason="RSI überverkauft";}
-    else if(chg>5&&rsi<68){signal="BUY";strength=68+Math.min(20,chg*2);reason="Starker Aufwärtstrend";}
-    else if(chg>2.5&&rsi<60){signal="BUY";strength=58+Math.min(15,chg*4);reason="Aufwärtsmomentum";}
-    else if(rsi>73&&chg<1){signal="SELL";strength=68+Math.min(20,rsi-70);reason="RSI überkauft";}
-    else if(chg<-5){signal="SELL";strength=68+Math.min(20,Math.abs(chg)*2);reason="Starker Abwärtsdruck";}
-    else if(chg<-2.5&&rsi>45){signal="SELL";strength=55+Math.min(15,Math.abs(chg)*3);reason="Abwärtsdynamik";}
+
+    // ── MACD ──
+    const {macd,signal:macdSig,hist:macdHist}=calcMACD(hist);
+    const macdBull = macdHist!==null && macdHist>0;   // MACD über Signal = bullisch
+    const macdCross = macdHist!==null && Math.abs(macdHist)<0.0001*px; // Crossover nah
+    const macdStrong = macdHist!==null && Math.abs(macdHist)>0.001*px;  // starkes Signal
+
+    // ── VOLUMEN ──
+    const vols=volHist[c.sym]||[vol];
+    const avgVol=vols.slice(0,-1).reduce((a,b)=>a+b,0)/Math.max(vols.length-1,1)||vol;
+    const volSpike = vol > avgVol*1.3; // 30% über Durchschnitt
+    const volCrash = vol < avgVol*0.7; // 30% unter Durchschnitt
+
+    // ── BOLLINGER BÄNDER ──
+    const bb=calcBollinger(hist, Math.min(20,hist.length));
+    const bbLow  = bb.lower && px < bb.lower;  // Preis unter unterem Band → überverkauft
+    const bbHigh = bb.upper && px > bb.upper;  // Preis über oberem Band → überkauft
+    const bbMid  = bb.mid;
+    const bbSqueeze = bb.bw && bb.bw < 2.0;   // Enge Bänder = Ausbruch steht bevor
+
+    // ── SCORE SYSTEM ──
+    let score=0, reasons=[];
+
+    // RSI Punkte
+    if(rsi<30){score+=35;reasons.push("RSI überverkauft("+Math.round(rsi)+")");}
+    else if(rsi<40){score+=20;reasons.push("RSI tief("+Math.round(rsi)+")");}
+    else if(rsi>75){score-=35;reasons.push("RSI überkauft("+Math.round(rsi)+")");}
+    else if(rsi>65){score-=20;reasons.push("RSI hoch("+Math.round(rsi)+")");}
+
+    // MACD Punkte
+    if(macdHist!==null){
+      if(macdBull&&macdStrong){score+=25;reasons.push("MACD bullisch");}
+      else if(macdBull){score+=12;reasons.push("MACD leicht+");}
+      else if(!macdBull&&macdStrong){score-=25;reasons.push("MACD bearisch");}
+      else if(!macdBull){score-=12;reasons.push("MACD leicht-");}
+    }
+
+    // Momentum Punkte
+    if(chg>5){score+=20;reasons.push("Momentum+"+chg.toFixed(1)+"%");}
+    else if(chg>2){score+=10;reasons.push("Trend+"+chg.toFixed(1)+"%");}
+    else if(chg<-5){score-=20;reasons.push("Momentum"+chg.toFixed(1)+"%");}
+    else if(chg<-2){score-=10;reasons.push("Trend"+chg.toFixed(1)+"%");}
+
+    // Volumen Bestätigung
+    if(volSpike&&score>0){score+=15;reasons.push("Vol-Spike ▲");}
+    else if(volSpike&&score<0){score-=15;reasons.push("Vol-Spike ▼");}
+    else if(volCrash){score=score*0.7;reasons.push("Vol schwach");}
+
+    // Bollinger Punkte
+    if(bbLow){score+=20;reasons.push("BB-Unterkante Bounce");}
+    else if(bbHigh){score-=20;reasons.push("BB-Oberkante Überkauft");}
+    if(bbSqueeze){reasons.push("BB-Squeeze⚡");}  // Squeeze ist neutral - kein Bias
+
+    // ── SIGNAL ENTSCHEIDUNG ──
+    let signal="HOLD", strength=50, reason="Konsolidierung";
+    if(score>=30){
+      signal="BUY";
+      strength=Math.min(95,55+score);
+      reason=reasons.slice(0,2).join(" · ");
+    } else if(score<=-30){
+      signal="SELL";
+      strength=Math.min(95,55+Math.abs(score));
+      reason=reasons.slice(0,2).join(" · ");
+    } else {
+      strength=Math.max(30,50-Math.abs(score));
+      reason=reasons.length?reasons[0]:"Neutral";
+    }
     strength=Math.round(Math.min(95,Math.max(30,strength)));
-    signals[c.sym]={sym:c.sym,signal,strength,reason,
-      target:px*(signal==="BUY"?1.04+strength/2000:0.97),
-      stopLoss:px*(1-c.sl),rsi:Math.round(rsi)};
+
+    signals[c.sym]={
+      sym:c.sym, signal, strength, reason,
+      target: px*(signal==="BUY"?1.04+strength/2000:0.97),
+      stopLoss: px*(1-c.sl*(1+LEVERAGE*0.3)), // Tighter SL bei Hebel
+      rsi: Math.round(rsi),
+      macdHist: macdHist?macdHist.toFixed(6):null,
+      macdBull, volSpike, score:Math.round(score),
+      bb:{upper:bb.upper?bb.upper.toFixed(4):null, lower:bb.lower?bb.lower.toFixed(4):null, mid:bb.mid?bb.mid.toFixed(4):null, squeeze:bbSqueeze},
+      bbLow, bbHigh, reasons:[...reasons]
+    };
   });
-  addLog("f","Signale: "+Object.values(signals).map(s=>s.sym+(s.signal==="BUY"?"▲":s.signal==="SELL"?"▼":"◆")).join(" "));
+  addLog("f","Indikatoren: "+Object.values(signals).map(s=>
+    s.sym+(s.signal==="BUY"?"▲":s.signal==="SELL"?"▼":"◆")+"("+s.score+")"
+  ).join(" "));
+}
+
+// ── AUTO LEVERAGE (Bot entscheidet) ──
+function calcAutoLev(sym){
+  const sig=signals[sym]; if(!sig) return 1;
+  const score=sig.score||0, rsi=sig.rsi||50;
+  let bullCount=0;
+  if(score>=55) bullCount++;
+  if(rsi<32) bullCount++;
+  if(sig.macdBull) bullCount++;
+  if(sig.volSpike) bullCount++;
+  if(sig.bbLow) bullCount++;
+  if(bullCount>=4) return 10;
+  if(bullCount>=3||score>=45) return 5;
+  return 1;
 }
 
 // ── AUTO TRADE ──
@@ -300,37 +486,59 @@ function autoTrade(){
     if(!sig||!px) return;
     const pos=port.positions[c.sym];
     // Stop-loss check
-    if(pos&&px<=pos.sl){sell(c.sym,px,"🛑 Stop-Loss"); return;}
+    if(pos&&px<=pos.sl){ sell(c.sym,px,"🛑 Stop-Loss"); return; }
     // Sell signal
-    if(pos&&sig.signal==="SELL"&&sig.strength>=55){sell(c.sym,px,"▼ Signal ("+sig.strength+"%)"); return;}
+    if(pos&&sig.signal==="SELL"&&sig.strength>=55){ sell(c.sym,px,"▼ Signal ("+sig.strength+"%)"); return; }
     // Buy signal
     if(!pos&&sig.signal==="BUY"&&sig.strength>=60){
       const inv=port.cash*POS_SIZE;
-      if(inv>=50) buy(c.sym,px,inv,sig.stopLoss,sig.reason);
+      if(inv>=50){ buy(c.sym,px,inv,sig.stopLoss,sig.reason); return; }
+    }
+    // HOLD — immer in History loggen (max 1 pro Coin pro Minute)
+    const lastHold=port.trades.find(t=>t.type==="HOLD"&&t.sym===c.sym);
+    const now=Date.now();
+    if(!lastHold||now-(lastHold.ts||0)>55000){
+      port.trades.unshift({
+        type:"HOLD", sym:c.sym, px, qty:0, pnl:0,
+        lev:LEVERAGE, reason:sig.reason,
+        indicators:{rsi:sig.rsi,macd:sig.macdBull?"BULL":"BEAR",vol:sig.volSpike?"SPIKE":"NORMAL",bb:sig.bbLow?"UNTER":sig.bbHigh?"ÜBER":"MITTE",score:sig.score},
+        time:new Date().toLocaleTimeString("de-DE"), ts:now
+      });
+      if(port.trades.length>100) port.trades.pop();
     }
   });
 }
 
 function buy(sym,px,inv,sl,reason){
+  const lev=calcAutoLev(sym); // Bot wählt Hebel automatisch
   const qty=inv/px;
   port.cash-=inv;
-  port.positions[sym]={qty,entry:px,sl,time:new Date().toLocaleTimeString("de-DE")};
+  const sig=signals[sym];
+  const fullReason=sig?sig.reasons.join(" · "):reason;
+  port.positions[sym]={
+    qty, entry:px, sl:px*(1-COINS.find(c=>c.sym===sym).sl*(1+lev*0.3)),
+    lev, reason:fullReason,
+    indicators:{rsi:sig?.rsi, macd:sig?.macdBull?"BULL":"BEAR", vol:sig?.volSpike?"SPIKE":"NORMAL", bb:sig?.bbLow?"UNTER":sig?.bbHigh?"ÜBER":"MITTE", score:sig?.score},
+    time:new Date().toLocaleTimeString("de-DE")
+  };
   port.total++;
-  addLog("b","KAUF "+sym+" · "+qty.toFixed(4)+" @ $"+fmtP(px)+" · SL $"+fmtP(sl));
-  port.trades.unshift({type:"BUY",sym,px,qty,pnl:0,reason,time:new Date().toLocaleTimeString("de-DE")});
+  addLog("b","KAUF "+sym+" AUTO-"+lev+"x · "+qty.toFixed(4)+" @ $"+fmtP(px)+" · "+fullReason.substring(0,40));
+  port.trades.unshift({type:"BUY",sym,px,qty,pnl:0,lev,reason:fullReason,time:new Date().toLocaleTimeString("de-DE")});
   saveState();
 }
 
 function sell(sym,px,reason){
   const pos=port.positions[sym];
   if(!pos) return;
-  const val=pos.qty*px, pnl=val-(pos.qty*pos.entry);
-  port.cash+=val;
+  const val=pos.qty*px;
+  const rawPnl=val-(pos.qty*pos.entry);
+  const pnl=rawPnl*(pos.lev||1); // Hebel auf P&L
+  port.cash+=val+(pnl-rawPnl);   // Hebel-PnL adjustiert
   if(pnl>0) port.wins++;
   delete port.positions[sym];
   port.total++;
-  addLog("s","VERKAUF "+sym+" · $"+fmt(val)+" · PnL "+(pnl>=0?"+":"")+"$"+fmt(pnl)+" · "+reason);
-  port.trades.unshift({type:"SELL",sym,px,qty:pos.qty,pnl,reason,time:new Date().toLocaleTimeString("de-DE")});
+  addLog("s","VERKAUF "+sym+" "+(pos.lev||1)+"x · PnL "+(pnl>=0?"+":"")+"$"+fmt(pnl)+" · "+reason);
+  port.trades.unshift({type:"SELL",sym,px,qty:pos.qty,pnl,lev:pos.lev||1,reason,time:new Date().toLocaleTimeString("de-DE")});
   if(port.trades.length>50) port.trades.pop();
   saveState();
 }
@@ -404,10 +612,25 @@ function renderCoins(){
       </div>
       <div class="sbar"><div class="sbar-f" style="width:${sig?.strength||0}%;background:${col}"></div></div>
       <div class="cbot">
-        <div><div class="cst-lbl">TARGET</div><div class="cst-val green">${sig?.target?"$"+fmtP(sig.target):"—"}</div></div>
-        <div><div class="cst-lbl">STOP LOSS</div><div class="cst-val red">${sig?.stopLoss?"$"+fmtP(sig.stopLoss):"—"}</div></div>
-        <div><div class="cst-lbl">GRUND</div><div class="cst-val" style="color:${col};font-size:9px">${sig?.reason?.substring(0,14)||"—"}</div></div>
+        <div>
+          <div class="cst-lbl">RSI</div>
+          <div class="cst-val" style="color:${!sig?"#243444":sig.rsi<35?"#00E5A0":sig.rsi>70?"#FF3355":"#FFB800"}">${sig?.rsi||"—"}</div>
+        </div>
+        <div>
+          <div class="cst-lbl">MACD</div>
+          <div class="cst-val" style="color:${!sig?"#243444":sig.macdBull?"#00E5A0":"#FF3355"}">${!sig?"—":sig.macdBull?"▲ BULL":"▼ BEAR"}</div>
+        </div>
+        <div>
+          <div class="cst-lbl">VOLUMEN</div>
+          <div class="cst-val" style="color:${!sig?"#243444":sig.volSpike?"#FFB800":"#4A6A80"}">${!sig?"—":sig.volSpike?"⚡ SPIKE":"Normal"}</div>
+        </div>
       </div>
+      <div style="padding:6px 16px;border-top:1px solid #0D1F2D;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px">
+        <div style="font-size:8px;color:#243444">SCORE: <span style="color:${!sig?"#243444":sig.score>0?"#00E5A0":sig.score<0?"#FF3355":"#4A6A80"};font-weight:700">${sig?.score||0}</span></div>
+        <div style="font-size:8px;color:${!sig?"#243444":sig.bbLow?"#00E5A0":sig.bbHigh?"#FF3355":sig.bb?.squeeze?"#FFB800":"#243444"}">BB: ${!sig?"—":sig.bbLow?"▲ UNTER":sig.bbHigh?"▼ ÜBER":sig.bb?.squeeze?"⚡SQUEEZE":"MITTE"}</div>
+        <div style="font-size:8px;color:#243444">SL: <span style="color:#FF3355">${sig?.stopLoss?"$"+fmtP(sig.stopLoss):"—"}</span></div>
+      </div>
+      <div style="padding:4px 16px 8px;font-size:9px;color:#4A6A80">${sig?.reason?.substring(0,36)||"—"}</div>
       ${pos?`<div class="cpos"><span class="cpos-lbl">◈ POSITION OFFEN</span><span class="cpos-val" style="color:${posPnl>=0?"#00E5A0":"#FF3355"}">${posPnl>=0?"+":""}$${fmt(posPnl)}</span></div>`:""}
     </div>`;
   }).join("");
@@ -419,14 +642,32 @@ function renderPort(){
   if(!ent.length){el.innerHTML='<div class="pt-empty">KEINE OFFENEN POSITIONEN</div>';return;}
   el.innerHTML=ent.map(([sym,pos])=>{
     const px=prices[sym]?.price||pos.entry;
-    const val=pos.qty*px, pnl=val-(pos.qty*pos.entry);
-    return `<div class="pt-row">
-      <div class="pt-cell" style="font-weight:700;color:#E8F4FF">${sym}</div>
-      <div class="pt-cell">${pos.qty.toFixed(4)}</div>
-      <div class="pt-cell">$${fmtP(pos.entry)}</div>
-      <div class="pt-cell">$${fmtP(px)}</div>
-      <div class="pt-cell">$${fmt(val)}</div>
-      <div class="pt-cell" style="color:${pnl>=0?"#00E5A0":"#FF3355"}">${pnl>=0?"+":""}$${fmt(pnl)}</div>
+    const val=pos.qty*px;
+    const rawPnl=val-(pos.qty*pos.entry);
+    const pnl=rawPnl*(pos.lev||1);
+    const ind=pos.indicators||{};
+    return `<div style="border-bottom:1px solid #0D1F2D;">
+      <div class="pt-row" style="grid-template-columns:1fr 1fr 1fr 1fr 1fr 1fr">
+        <div class="pt-cell" style="font-weight:700;color:#E8F4FF">${sym} <span style="font-size:8px;color:#FFB800;margin-left:4px">${pos.lev||1}x</span></div>
+        <div class="pt-cell">${pos.qty.toFixed(4)}</div>
+        <div class="pt-cell">$${fmtP(pos.entry)}</div>
+        <div class="pt-cell">$${fmtP(px)}</div>
+        <div class="pt-cell">$${fmt(val)}</div>
+        <div class="pt-cell" style="color:${pnl>=0?"#00E5A0":"#FF3355"}">${pnl>=0?"+":""}$${fmt(pnl)}</div>
+      </div>
+      <div style="padding:8px 16px 10px;background:rgba(0,229,160,.02);display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+        <span style="font-size:8px;color:#243444;letter-spacing:2px">GRUND:</span>
+        <span style="font-size:9px;color:#4A6A80">${pos.reason?.substring(0,60)||"—"}</span>
+      </div>
+      <div style="padding:4px 16px 10px;display:flex;gap:10px;flex-wrap:wrap">
+        ${ind.rsi!=null?`<span style="font-size:8px;padding:2px 6px;border-radius:3px;background:#081018;border:1px solid #0D1F2D;color:${ind.rsi<40?"#00E5A0":ind.rsi>65?"#FF3355":"#4A6A80"}">RSI ${ind.rsi}</span>`:""}
+        ${ind.macd?`<span style="font-size:8px;padding:2px 6px;border-radius:3px;background:#081018;border:1px solid #0D1F2D;color:${ind.macd==="BULL"?"#00E5A0":"#FF3355"}">MACD ${ind.macd}</span>`:""}
+        ${ind.vol?`<span style="font-size:8px;padding:2px 6px;border-radius:3px;background:#081018;border:1px solid #0D1F2D;color:${ind.vol==="SPIKE"?"#FFB800":"#4A6A80"}">VOL ${ind.vol}</span>`:""}
+        ${ind.bb?`<span style="font-size:8px;padding:2px 6px;border-radius:3px;background:#081018;border:1px solid #0D1F2D;color:#0EA5E9">BB ${ind.bb}</span>`:""}
+        ${ind.score!=null?`<span style="font-size:8px;padding:2px 6px;border-radius:3px;background:#081018;border:1px solid #0D1F2D;color:${ind.score>0?"#00E5A0":"#FF3355"}">SCORE ${ind.score}</span>`:""}
+        <span style="font-size:8px;padding:2px 6px;border-radius:3px;background:rgba(255,51,85,.1);border:1px solid rgba(255,51,85,.2);color:#FF3355">SL $${fmtP(pos.sl)}</span>
+        <span style="font-size:8px;color:#243444">seit ${pos.time}</span>
+      </div>
     </div>`;
   }).join("");
 }
@@ -434,19 +675,31 @@ function renderPort(){
 function renderHist(){
   const el=document.getElementById("histEl");
   if(!port.trades.length){el.innerHTML='<div class="hempty">NOCH KEINE TRADES</div>';return;}
-  el.innerHTML=port.trades.map(t=>`
-    <div class="hi">
+  el.innerHTML=port.trades.map(t=>{
+    const col=t.type==="BUY"?"#00E5A0":t.type==="SELL"?"#FF3355":"#243444";
+    const icon=t.type==="BUY"?"▲ KAUF":t.type==="SELL"?"▼ VERKAUF":"◆ HALTEN";
+    const ind=t.indicators||{};
+    return `<div class="hi">
       <div>
-        <div class="hi-type" style="color:${t.type==="BUY"?"#00E5A0":"#FF3355"}">${t.type==="BUY"?"▲ KAUF":"▼ VERKAUF"}</div>
-        <div class="hi-coin">${t.sym}</div>
+        <div class="hi-type" style="color:${col}">${icon}</div>
+        <div class="hi-coin">${t.sym} ${t.lev>1?'<span style="font-size:9px;color:#FFB800">'+t.lev+'x</span>':''}</div>
         <div class="hi-time">${t.time}</div>
       </div>
       <div style="text-align:right">
-        <div class="hi-pr">$${fmtP(t.px)} · ${t.qty.toFixed(4)}</div>
+        <div class="hi-pr" style="color:${t.type==="HOLD"?"#243444":"#E8F4FF"}">$${fmtP(t.px)}</div>
         ${t.type==="SELL"?`<div class="hi-pnl" style="color:${t.pnl>=0?"#00E5A0":"#FF3355"}">${t.pnl>=0?"+":""}$${fmt(t.pnl)}</div>`:""}
-        <div class="hi-rsn">${t.reason}</div>
+        <div class="hi-rsn">${t.reason?.substring(0,36)||""}</div>
       </div>
-    </div>`).join("");
+      ${t.type!=="HOLD"||ind.score!=null?`
+      <div style="width:100%;padding:4px 0 2px;display:flex;gap:4px;flex-wrap:wrap">
+        ${ind.rsi!=null?`<span style="font-size:7px;padding:1px 5px;border-radius:2px;background:#081018;border:1px solid #0D1F2D;color:${ind.rsi<40?"#00E5A0":ind.rsi>65?"#FF3355":"#4A6A80"}">RSI ${ind.rsi}</span>`:""}
+        ${ind.macd?`<span style="font-size:7px;padding:1px 5px;border-radius:2px;background:#081018;border:1px solid #0D1F2D;color:${ind.macd==="BULL"?"#00E5A0":"#FF3355"}">MACD ${ind.macd}</span>`:""}
+        ${ind.vol?`<span style="font-size:7px;padding:1px 5px;border-radius:2px;background:#081018;border:1px solid #0D1F2D;color:${ind.vol==="SPIKE"?"#FFB800":"#243444"}">VOL ${ind.vol}</span>`:""}
+        ${ind.bb?`<span style="font-size:7px;padding:1px 5px;border-radius:2px;background:#081018;border:1px solid #0D1F2D;color:#0EA5E9">BB ${ind.bb}</span>`:""}
+        ${ind.score!=null?`<span style="font-size:7px;padding:1px 5px;border-radius:2px;background:#081018;border:1px solid #0D1F2D;color:${ind.score>0?"#00E5A0":ind.score<0?"#FF3355":"#243444"}">SCORE ${ind.score}</span>`:""}
+      </div>`:``}
+    </div>`;
+  }).join("");
 }
 
 function renderLog(){
