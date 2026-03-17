@@ -114,7 +114,7 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
   <!-- HEADER -->
   <div class="header">
     <div>
-      <div class="h-tag">PAPER TRADING BOT · LIVE · AUTO · KEIN ECHTES GELD</div>
+      <div class="h-tag">PAPER TRADING BOT · BITVAVO · LIVE · KEIN ECHTES GELD</div>
       <div class="h-title">◈ TRADING TERMINAL</div>
     </div>
     <div class="h-right">
@@ -129,14 +129,15 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
         <button class="btn lev-btn" id="int5" onclick="setInterval2(5)">5m</button>
       </div>
       <button class="btn btn-g" id="btnScan" onclick="fullScan()">↺ SCAN</button>
+      <button class="btn" style="color:#0EA5E9;border-color:rgba(14,165,233,.3)" onclick="downloadLog()" title="Trade Log herunterladen">⬇ LOG</button>
       <button class="btn btn-r" onclick="doReset()">↺ RESET</button>
     </div>
   </div>
 
   <!-- PORTFOLIO BAR -->
   <div class="pbar">
-    <div class="pc"><div class="pc-lbl">GESAMTWERT</div><div class="pc-val" id="pTotal">$10,000</div><div class="pc-sub" id="pPnl">—</div></div>
-    <div class="pc"><div class="pc-lbl">CASH</div><div class="pc-val" id="pCash">$10,000</div><div class="pc-sub" id="pCashPct">100%</div></div>
+    <div class="pc"><div class="pc-lbl">GESAMTWERT</div><div class="pc-val" id="pTotal">€10.000</div><div class="pc-sub" id="pPnl">—</div></div>
+    <div class="pc"><div class="pc-lbl">CASH</div><div class="pc-val" id="pCash">€10.000</div><div class="pc-sub" id="pCashPct">100%</div></div>
     <div class="pc"><div class="pc-lbl">POSITIONEN</div><div class="pc-val" id="pPos">0</div><div class="pc-sub" id="pPosVal">$0 investiert</div></div>
     <div class="pc"><div class="pc-lbl">TRADES / WIN</div><div class="pc-val" id="pTrades">0</div><div class="pc-sub" id="pWin">— Win Rate</div></div>
   </div>
@@ -165,7 +166,10 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
   <div id="v-market"><div class="cgrid" id="coinsEl"></div></div>
   <!-- PORTFOLIO -->
   <div id="v-port" style="display:none">
-    <div class="slbl">OFFENE POSITIONEN</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div class="slbl" style="margin-bottom:0">OFFENE POSITIONEN</div>
+      <button class="btn btn-r" style="font-size:9px" onclick="closeAllPositions('🔒 Manuell geschlossen');updateUI()">✕ ALLE SCHLIESSEN</button>
+    </div>
     <div class="ptbl">
       <div class="pt-hdr">
         <div class="pt-col">COIN</div><div class="pt-col">MENGE</div><div class="pt-col">EINSTIEG</div>
@@ -185,7 +189,7 @@ body{background:#020407;font-family:'Courier New',monospace;color:#C8DFF0;min-he
     <div class="logbox" id="logEl"></div>
   </div>
 
-  <div class="footer">◈ PAPER TRADING · SPIELGELD $10.000 · KEINE ANLAGEBERATUNG</div>
+  <div class="footer">◈ PAPER TRADING · BITVAVO PREISE · SPIELGELD €10.000 · KEINE ANLAGEBERATUNG</div>
 </div>
 
 <script>
@@ -221,14 +225,43 @@ window.onload=()=>{
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-// ── EXCHANGE SYMBOLE ──
-const BINANCE={ETH:"ETHUSDT",BTC:"BTCUSDT",SOL:"SOLUSDT",HBAR:"HBARUSDT",NEAR:"NEARUSDT",AVAX:"AVAXUSDT"};
-const KUCOIN={KAS:"KAS-USDT"}; // KAS nur auf KuCoin
+// ── BITVAVO SYMBOLE (EUR) ──
+const BITVAVO={ETH:"ETH-EUR",BTC:"BTC-EUR",SOL:"SOL-EUR",HBAR:"HBAR-EUR",NEAR:"NEAR-EUR",AVAX:"AVAX-EUR",KAS:"KAS-EUR"};
 
 // Klines-Historie für MACD (close prices, 1h Kerzen, 26 Stück)
 const klineHist={};
 // Volumen-Historie
 const volHist={};
+
+// ── FETCH PREISE (Bitvavo - kein CORS) ──
+async function fetchPrices(){
+  try{
+    const r=await fetch("https://api.bitvavo.com/v2/ticker/24h");
+    if(!r.ok) throw new Error("Bitvavo "+r.status);
+    const arr=await r.json();
+    const data={};
+    arr.forEach(t=>{ data[t.market]=t; });
+    COINS.forEach(c=>{
+      const pair=BITVAVO[c.sym];
+      const t=data[pair];
+      if(!t) return;
+      const px=parseFloat(t.last);
+      const open=parseFloat(t.open);
+      const chg=open?((px-open)/open*100):0;
+      const vol=parseFloat(t.volumeQuote)||0;
+      prices[c.sym]={price:px, chg, vol};
+      if(!priceHist[c.sym]) priceHist[c.sym]=[];
+      priceHist[c.sym].push(px);
+      if(priceHist[c.sym].length>26) priceHist[c.sym].shift();
+      if(!volHist[c.sym]) volHist[c.sym]=[];
+      volHist[c.sym].push(vol);
+      if(volHist[c.sym].length>10) volHist[c.sym].shift();
+    });
+    addLog("f","Preise via Bitvavo: ETH €"+(prices.ETH?.price?.toFixed(0)||"?")+" BTC €"+(prices.BTC?.price?.toFixed(0)||"?"));
+  }catch(e){
+    addLog("f","Bitvavo Fehler: "+e.message);
+  }
+}
 
 // ── EMA Berechnung ──
 function calcEMA(data, period){
@@ -264,7 +297,7 @@ async function fetchPrices(){
   try{
     const syms=Object.values(BINANCE).map(s=>'"'+s+'"').join(",");
     const r=await fetch("https://api.binance.com/api/v3/ticker/24hr?symbols=["+syms+"]");
-    if(!r.ok) throw new Error("Binance "+r.status);
+    if(!r.ok) throw new Error("Bitvavo "+r.status);
     const arr=await r.json();
     arr.forEach(t=>{
       const entry=Object.entries(BINANCE).find(([s,bs])=>bs===t.symbol);
@@ -291,53 +324,7 @@ async function fetchPrices(){
   }
 }
 
-async function fetchSingle(){
-  for(const c of COINS){
-    try{
-      // KAS → KuCoin, Rest → Binance
-      if(c.sym==="KAS"){
-        await fetchKAS(); continue;
-      }
-      const bs=BINANCE[c.sym]; if(!bs) continue;
-      const r=await fetch("https://api.binance.com/api/v3/ticker/24hr?symbol="+bs);
-      if(!r.ok) continue;
-      const t=await r.json();
-      const price=parseFloat(t.lastPrice), chg=parseFloat(t.priceChangePercent), vol=parseFloat(t.quoteVolume);
-      prices[c.sym]={price,chg,vol};
-      if(!priceHist[c.sym]) priceHist[c.sym]=[];
-      priceHist[c.sym].push(price);
-      if(priceHist[c.sym].length>26) priceHist[c.sym].shift();
-      if(!volHist[c.sym]) volHist[c.sym]=[];
-      volHist[c.sym].push(vol);
-      if(volHist[c.sym].length>10) volHist[c.sym].shift();
-    }catch(e){ addLog("f","Fehler "+c.sym+": "+e.message); }
-  }
-  addLog("f","Einzelpreise geladen");
-}
 
-async function fetchKAS(){
-  try{
-    // KuCoin public API - kein CORS Problem
-    const r=await fetch("https://api.kucoin.com/api/v1/market/stats?symbol=KAS-USDT");
-    if(!r.ok) throw new Error("KuCoin "+r.status);
-    const j=await r.json();
-    const d=j.data;
-    const price=parseFloat(d.last);
-    const open=parseFloat(d.open);
-    const chg=((price-open)/open)*100;
-    const vol=parseFloat(d.volValue); // Volumen in USDT
-    prices.KAS={price,chg,vol};
-    if(!priceHist.KAS) priceHist.KAS=[];
-    priceHist.KAS.push(price);
-    if(priceHist.KAS.length>26) priceHist.KAS.shift();
-    if(!volHist.KAS) volHist.KAS=[];
-    volHist.KAS.push(vol);
-    if(volHist.KAS.length>10) volHist.KAS.shift();
-    addLog("f","KAS via KuCoin: $"+price.toFixed(5)+" ("+chg.toFixed(2)+"%)");
-  }catch(e){
-    addLog("f","KAS KuCoin Fehler: "+e.message);
-  }
-}
 
 // ── INTERVALL UMSCHALTEN ──
 function setInterval2(mins){
@@ -732,13 +719,110 @@ function doReset(){
   updateUI();
 }
 
+// ── ALLE POSITIONEN SCHLIESSEN ──
+function closeAllPositions(reason){
+  const syms = Object.keys(port.positions);
+  if(!syms.length) return;
+  syms.forEach(sym=>{
+    const pos = port.positions[sym];
+    const px  = prices[sym]?.price || pos.entry;
+    const val = pos.qty * px;
+    const rawPnl = val - (pos.qty * pos.entry);
+    const pnl = rawPnl * (pos.lev||1);
+    port.cash += val + (pnl - rawPnl);
+    if(pnl>0) port.wins++;
+    port.total++;
+    addLog("s", "AUTO-CLOSE "+sym+" @ €"+fmtP(px)+" · PnL: "+(pnl>=0?"+":"")+"€"+fmt(pnl)+" · "+reason);
+    port.trades.unshift({
+      type:"SELL", sym, px, qty:pos.qty, pnl,
+      lev:pos.lev||1, reason,
+      time:new Date().toLocaleTimeString("de-DE"),
+      ts:Date.now()
+    });
+    delete port.positions[sym];
+  });
+  saveState();
+  addLog("f", syms.length+" Positionen geschlossen · Cash: €"+fmt(port.cash));
+}
+
+// ── LOG DOWNLOAD ──
+function downloadLog(){
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0,10);
+  const timeStr = now.toLocaleTimeString("de-DE").replace(/:/g,"-");
+
+  // Portfolio Summary
+  let posVal=0;
+  Object.entries(port.positions).forEach(([sym,p])=>{ posVal+=p.qty*(prices[sym]?.price||p.entry); });
+  const total=port.cash+posVal;
+  const pnl=total-START;
+
+  const logData = {
+    exportTime: now.toISOString(),
+    portfolio: {
+      startCapital: START,
+      currentCash: port.cash,
+      positionsValue: posVal,
+      totalValue: total,
+      totalPnL: pnl,
+      totalPnLPct: (pnl/START*100).toFixed(2)+"%",
+      totalTrades: port.total,
+      wins: port.wins,
+      winRate: port.total>0?(port.wins/port.total*100).toFixed(1)+"%":"—"
+    },
+    openPositions: Object.entries(port.positions).map(([sym,p])=>({
+      sym, qty:p.qty, entryPrice:p.entry,
+      currentPrice: prices[sym]?.price||p.entry,
+      stopLoss: p.sl, leverage: p.lev||1,
+      reason: p.reason, openedAt: p.time,
+      unrealizedPnL: ((prices[sym]?.price||p.entry)-p.entry)*p.qty*(p.lev||1)
+    })),
+    tradeHistory: port.trades.map(t=>({
+      type: t.type,
+      symbol: t.sym,
+      price: t.px,
+      quantity: t.qty,
+      pnl: t.pnl,
+      leverage: t.lev||1,
+      reason: t.reason,
+      time: t.time,
+      indicators: t.indicators||{}
+    })),
+    priceSnapshot: Object.fromEntries(
+      Object.entries(prices).map(([sym,p])=>[sym,{price:p.price,change24h:p.chg}])
+    )
+  };
+
+  const blob = new Blob([JSON.stringify(logData, null, 2)], {type:"application/json"});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `trade_log_${dateStr}_${timeStr}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  addLog("f", "Log heruntergeladen: trade_log_"+dateStr+".json");
+}
+
+// ── AUTO-CLOSE BEIM SCHLIESSEN ──
+window.addEventListener("beforeunload", (e)=>{
+  const posCount = Object.keys(port.positions).length;
+  if(posCount > 0){
+    closeAllPositions("🔒 Seite geschlossen");
+    saveState();
+    // Browser-Warnung anzeigen
+    e.preventDefault();
+    e.returnValue = posCount+" offene Positionen werden geschlossen. Fortfahren?";
+    return e.returnValue;
+  }
+});
+
 function saveState(){localStorage.setItem("ptb3",JSON.stringify({port,priceHist}));}
 function loadState(){
   try{const s=localStorage.getItem("ptb3");if(s){const d=JSON.parse(s);port=d.port||port;priceHist=d.priceHist||{};}}catch(e){}
 }
 
-function fmt(n){if(!n&&n!==0)return"0.00";const a=Math.abs(n);return(a>=1000?(n/1000).toFixed(2)+"K":n.toFixed(2));}
-function fmtP(n){if(!n)return"?";if(n>=1000)return n.toFixed(0);if(n>=1)return n.toFixed(3);return n.toFixed(5);}
+function fmt(n){if(!n&&n!==0)return"0.00";const a=Math.abs(n);return(a>=1000?"€"+(n/1000).toFixed(2)+"K":"€"+n.toFixed(2));}
+function fmtP(n){if(!n)return"?";if(n>=1000)return"€"+n.toFixed(0);if(n>=1)return"€"+n.toFixed(3);return"€"+n.toFixed(5);}
 </script>
 </body>
 </html>
